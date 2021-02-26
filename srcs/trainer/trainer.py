@@ -25,8 +25,9 @@ class Trainer(BaseTrainer):
         self.valid_data_loader = valid_data_loader
         self.lr_scheduler = lr_scheduler
 
-        self.train_metrics = BatchMetrics('loss', *[m.__name__ for m in self.metric_ftns], postfix='/train', writer=self.writer)
-        self.valid_metrics = BatchMetrics('loss', *[m.__name__ for m in self.metric_ftns], postfix='/valid', writer=self.writer)
+        args = ['loss', *[m.__name__ for m in self.metric_ftns]]
+        self.train_metrics = BatchMetrics(*args, postfix='/train', writer=self.writer)
+        self.valid_metrics = BatchMetrics(*args, postfix='/valid', writer=self.writer)
 
     def _train_epoch(self, epoch):
         """
@@ -46,15 +47,16 @@ class Trainer(BaseTrainer):
             loss.backward()
             self.optimizer.step()
 
+            loss = collect(loss)
             self.writer.set_step((epoch - 1) * self.len_epoch + batch_idx)
-            self.train_metrics.update('loss', collect(loss))
+            self.train_metrics.update('loss', loss)
 
             if batch_idx % self.log_step == 0:
                 self.writer.add_image('train/input', make_grid(data.cpu(), nrow=8, normalize=True))
                 for met in self.metric_ftns:
                     metric = collect(met(output, target)) # average metric between processes
                     self.train_metrics.update(met.__name__, metric)
-                self.logger.info(f'Train Epoch: {epoch} {self._progress(batch_idx)} Loss: {loss.item():.6f}')
+                self.logger.info(f'Train Epoch: {epoch} {self._progress(batch_idx)} Loss: {loss:.6f}')
 
             if batch_idx == self.len_epoch:
                 break
@@ -70,7 +72,7 @@ class Trainer(BaseTrainer):
         # add result metrics on entire epoch to tensorboard
         self.writer.set_step(epoch)
         for k, v in log.items():
-            self.writer.add_scalar(k+'/epoch', v)
+            self.writer.add_scalar(k + '/epoch', v)
         return log
 
     def _valid_epoch(self, epoch):
@@ -91,7 +93,7 @@ class Trainer(BaseTrainer):
 
                 self.writer.set_step((epoch - 1) * len(self.valid_data_loader) + batch_idx)
                 self.writer.add_image('valid/input', make_grid(data.cpu(), nrow=8, normalize=True))
-                self.valid_metrics.update('loss', loss.item())
+                self.valid_metrics.update('loss', collect(loss))
                 for met in self.metric_ftns:
                     self.valid_metrics.update(met.__name__, met(output, target))
 

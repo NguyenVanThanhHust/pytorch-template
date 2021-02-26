@@ -1,5 +1,3 @@
-import os
-import signal
 import torch
 import torch.distributed as dist
 from abc import abstractmethod, ABCMeta
@@ -76,33 +74,34 @@ class BaseTrainer(metaclass=ABCMeta):
             # print result metrics of this epoch
             max_line_width = max(len(line) for line in str(self.ep_metrics).splitlines())
             # divider ---
-            self.logger.info('-'*max_line_width)
+            self.logger.info('-' * max_line_width)
             self.logger.info(str(self.ep_metrics.latest()) + '\n')
 
-            # check if model performance improved or not, for early stopping and topk saving
-            is_best = False
-            improved = self.ep_metrics.is_improved()
-            if improved:
-                not_improved_count = 0
-                is_best = True
-            else:
-                not_improved_count += 1
+            if is_master():
+                # check if model performance improved or not, for early stopping and topk saving
+                is_best = False
+                improved = self.ep_metrics.is_improved()
+                if improved:
+                    not_improved_count = 0
+                    is_best = True
+                else:
+                    not_improved_count += 1
 
-            if not_improved_count > self.early_stop and is_master():
-                self.logger.info("Validation performance didn\'t improve for {} epochs. "
-                                 "Training stops.".format(self.early_stop))
-                os.kill(os.getppid(), signal.SIGTERM)
+                if not_improved_count > self.early_stop:
+                    self.logger.info("Validation performance didn\'t improve for {} epochs. "
+                                     "Training stops.".format(self.early_stop))
+                    exit(1)
 
-            using_topk_save = self.checkpt_top_k > 0
-            self._save_checkpoint(epoch, save_best=is_best, save_latest=using_topk_save)
-            # keep top-k checkpoints only, using monitoring metrics
-            if using_topk_save:
-                self.ep_metrics.keep_topk_checkpt(self.checkpt_dir, self.checkpt_top_k)
+                using_topk_save = self.checkpt_top_k > 0
+                self._save_checkpoint(epoch, save_best=is_best, save_latest=using_topk_save)
+                # keep top-k checkpoints only, using monitoring metrics
+                if using_topk_save:
+                    self.ep_metrics.keep_topk_checkpt(self.checkpt_dir, self.checkpt_top_k)
 
-            self.ep_metrics.to_csv('epoch-results.csv')
+                self.ep_metrics.to_csv('epoch-results.csv')
 
-            # divider ===
-            self.logger.info('='*max_line_width)
+                # divider ===
+                self.logger.info('=' * max_line_width)
             dist.barrier()
 
 

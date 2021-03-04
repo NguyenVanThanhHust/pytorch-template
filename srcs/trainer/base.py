@@ -1,5 +1,6 @@
 import torch
 import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 from abc import abstractmethod, ABCMeta
 from pathlib import Path
 from shutil import copyfile
@@ -19,6 +20,8 @@ class BaseTrainer(metaclass=ABCMeta):
 
         self.device = config.local_rank
         self.model = model.to(self.device)
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        self.model = DistributedDataParallel(model, device_ids=[self.device], output_device=self.device)
 
         self.criterion = criterion
         self.metric_ftns = metric_ftns

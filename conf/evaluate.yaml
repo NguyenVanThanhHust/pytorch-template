@@ -6,7 +6,8 @@ metrics:
   - _target_: srcs.model.metric.top_k_acc
 
 defaults:
+  - _self_
   - dataset: mnist_test
 
-  - hydra/job_logging : custom
-  - hydra/run/dir: no_chdir
+  - working_dir: no_chdir
+  - override hydra/job_logging : custom

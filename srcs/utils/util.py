@@ -1,76 +1,67 @@
-import yaml
-import hydra
-import logging
+import json
 import torch
-import torch.distributed as dist
-from omegaconf import OmegaConf
+import pandas as pd
 from pathlib import Path
-from importlib import import_module
 from itertools import repeat
-from functools import partial, update_wrapper
+from collections import OrderedDict
 
 
-def is_master():
-    return not dist.is_initialized() or dist.get_rank() == 0
+def ensure_dir(dirname):
+    dirname = Path(dirname)
+    if not dirname.is_dir():
+        dirname.mkdir(parents=True, exist_ok=False)
 
-def get_logger(name=None):
-    if is_master():
-        # TODO: also configure logging for sub-processes(not master)
-        hydra_conf = OmegaConf.load('.hydra/hydra.yaml')
-        logging.config.dictConfig(OmegaConf.to_container(hydra_conf.hydra.job_logging, resolve=True))
-    return logging.getLogger(name)
+def read_json(fname):
+    fname = Path(fname)
+    with fname.open('rt') as handle:
+        return json.load(handle, object_hook=OrderedDict)
 
-
-def collect(scalar):
-    """
-    util function for DDP.
-    syncronize a python scalar or pytorch scalar tensor between GPU processes.
-    """
-    # move data to current device
-    if not isinstance(scalar, torch.Tensor):
-        scalar = torch.tensor(scalar)
-    scalar = scalar.to(dist.get_rank())
-
-    # average value between devices
-    dist.reduce(scalar, 0, dist.ReduceOp.SUM)
-    return scalar.item() / dist.get_world_size()
+def write_json(content, fname):
+    fname = Path(fname)
+    with fname.open('wt') as handle:
+        json.dump(content, handle, indent=4, sort_keys=False)
 
 def inf_loop(data_loader):
     ''' wrapper function for endless data loader. '''
     for loader in repeat(data_loader):
         yield from loader
 
-def instantiate(config, *args, is_func=False, **kwargs):
+def prepare_device(n_gpu_use):
     """
-    wrapper function for hydra.utils.instantiate.
-    1. return None if config.class is None
-    2. return function handle if is_func is True
+    setup GPU device if available. get gpu device indices which are used for DataParallel
     """
-    assert '_target_' in config, f'Config should have \'_target_\' for class instantiation.'
-    target = config['_target_']
-    if target is None:
-        return None
-    if is_func:
-        # get function handle
-        modulename, funcname = target.rsplit('.', 1)
-        mod = import_module(modulename)
-        func = getattr(mod, funcname)
+    n_gpu = torch.cuda.device_count()
+    if n_gpu_use > 0 and n_gpu == 0:
+        print("Warning: There\'s no GPU available on this machine,"
+              "training will be performed on CPU.")
+        n_gpu_use = 0
+    if n_gpu_use > n_gpu:
+        print(f"Warning: The number of GPU\'s configured to use is {n_gpu_use}, but only {n_gpu} are "
+              "available on this machine.")
+        n_gpu_use = n_gpu
+    device = torch.device('cuda:0' if n_gpu_use > 0 else 'cpu')
+    list_ids = list(range(n_gpu_use))
+    return device, list_ids
 
-        # make partial function with arguments given in config, code
-        kwargs.update({k: v for k, v in config.items() if k != '_target_'})
-        partial_func = partial(func, *args, **kwargs)
+class MetricTracker:
+    def __init__(self, *keys, writer=None):
+        self.writer = writer
+        self._data = pd.DataFrame(index=keys, columns=['total', 'counts', 'average'])
+        self.reset()
 
-        # update original function's __name__ and __doc__ to partial function
-        update_wrapper(partial_func, func)
-        return partial_func
-    return hydra.utils.instantiate(config, *args, **kwargs)
+    def reset(self):
+        for col in self._data.columns:
+            self._data[col].values[:] = 0
 
-def write_yaml(content, fname):
-    with fname.open('wt') as handle:
-        yaml.dump(content, handle, indent=2, sort_keys=False)
+    def update(self, key, value, n=1):
+        if self.writer is not None:
+            self.writer.add_scalar(key, value)
+        self._data.total[key] += value * n
+        self._data.counts[key] += n
+        self._data.average[key] = self._data.total[key] / self._data.counts[key]
 
-def write_conf(config, save_path):
-    save_path = Path(save_path)
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    config_dict = OmegaConf.to_container(config, resolve=True)
-    write_yaml(config_dict, save_path)
+    def avg(self, key):
+        return self._data.average[key]
+
+    def result(self):
+        return dict(self._data.average)

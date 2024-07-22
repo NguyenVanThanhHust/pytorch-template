@@ -1,11 +1,14 @@
-import numpy as np
-import hydra
+import argparse
+import collections
 import torch
-import torch.distributed as dist
-from omegaconf import OmegaConf
-from pathlib import Path
+import numpy as np
+import srcs.data_loader.data_loaders as module_data
+import srcs.model.loss as module_loss
+import srcs.model.metric as module_metric
+import srcs.model.model as module_arch
+from srcs.parse_config import ConfigParser
 from srcs.trainer import Trainer
-from srcs.utils import instantiate, get_logger
+from srcs.utils import prepare_device
 
 
 # fix random seeds for reproducibility
@@ -15,63 +18,56 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 np.random.seed(SEED)
 
+def main(config):
+    logger = config.get_logger('train')
 
-def train_worker(config):
-    logger = get_logger('train')
     # setup data_loader instances
-    data_loader, valid_data_loader = instantiate(config.data_loader)
+    data_loader = config.init_obj('data_loader', module_data)
+    valid_data_loader = data_loader.split_validation()
 
-    # build model. print it's structure and # trainable params.
-    model = instantiate(config.arch)
-    trainable_params = filter(lambda p: p.requires_grad, model.parameters())
+    # build model architecture, then print to console
+    model = config.init_obj('arch', module_arch)
     logger.info(model)
-    logger.info(f'Trainable parameters: {sum([p.numel() for p in trainable_params])}')
+
+    # prepare for (multi-device) GPU training
+    device, device_ids = prepare_device(config['n_gpu'])
+    model = model.to(device)
+    if len(device_ids) > 1:
+        model = torch.nn.DataParallel(model, device_ids=device_ids)
 
     # get function handles of loss and metrics
-    criterion = instantiate(config.loss, is_func=True)
-    metrics = [instantiate(met, is_func=True) for met in config['metrics']]
+    criterion = getattr(module_loss, config['loss'])
+    metrics = [getattr(module_metric, met) for met in config['metrics']]
 
-    # build optimizer, learning rate scheduler.
-    optimizer = instantiate(config.optimizer, model.parameters())
-    lr_scheduler = instantiate(config.lr_scheduler, optimizer)
+    # build optimizer, learning rate scheduler. delete every lines containing lr_scheduler for disabling scheduler
+    trainable_params = filter(lambda p: p.requires_grad, model.parameters())
+    optimizer = config.init_obj('optimizer', torch.optim, trainable_params)
+    lr_scheduler = config.init_obj('lr_scheduler', torch.optim.lr_scheduler, optimizer)
 
     trainer = Trainer(model, criterion, metrics, optimizer,
                       config=config,
+                      device=device,
                       data_loader=data_loader,
                       valid_data_loader=valid_data_loader,
                       lr_scheduler=lr_scheduler)
+
     trainer.train()
 
-def init_worker(rank, ngpus, working_dir, config):
-    # initialize training config
-    config = OmegaConf.create(config)
-    config.local_rank = rank
-    config.cwd = working_dir
-    # prevent access to non-existing keys
-    OmegaConf.set_struct(config, True)
-
-    dist.init_process_group(
-        backend='nccl',
-        init_method='tcp://127.0.0.1:34567',
-        world_size=ngpus,
-        rank=rank)
-    torch.cuda.set_device(rank)
-
-    # start training processes
-    train_worker(config)
-
-@hydra.main(config_path='conf/', config_name='train', version_base='1.1')
-def main(config):
-    n_gpu = torch.cuda.device_count()
-    assert n_gpu, 'Can\'t find any GPU device on this machine.'
-
-    working_dir = str(Path.cwd().relative_to(hydra.utils.get_original_cwd()))
-
-    if config.resume is not None:
-        config.resume = hydra.utils.to_absolute_path(config.resume)
-    config = OmegaConf.to_yaml(config, resolve=True)
-    torch.multiprocessing.spawn(init_worker, nprocs=n_gpu, args=(n_gpu, working_dir, config))
 
 if __name__ == '__main__':
-    # pylint: disable=no-value-for-parameter
-    main()
+    args = argparse.ArgumentParser(description='PyTorch Template')
+    args.add_argument('-c', '--config', default=None, type=str,
+                      help='config file path (default: None)')
+    args.add_argument('-r', '--resume', default=None, type=str,
+                      help='path to latest checkpoint (default: None)')
+    args.add_argument('-d', '--device', default=None, type=str,
+                      help='indices of GPUs to enable (default: all)')
+
+    # custom cli options to modify configuration from default values given in json file.
+    CustomArgs = collections.namedtuple('CustomArgs', 'flags type target')
+    options = [
+        CustomArgs(['--lr', '--learning_rate'], type=float, target='optimizer;args;lr'),
+        CustomArgs(['--bs', '--batch_size'], type=int, target='data_loader;args;batch_size')
+    ]
+    config = ConfigParser.from_args(args, options)
+    main(config)
